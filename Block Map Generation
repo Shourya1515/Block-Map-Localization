@@ -1,0 +1,1149 @@
+import open3d as o3d
+import numpy as np
+import glob
+import os
+import time
+import matplotlib.pyplot as plt
+from scipy.spatial.transform import Rotation
+from IPython.display import display, clear_output
+
+# Try to enable GPU support if available
+try:
+    print("Checking for CUDA support...")
+    o3d.core.cuda.init()
+    if o3d.core.cuda.is_available():
+        print("CUDA is available. GPU acceleration enabled.")
+        USE_GPU = True
+    else:
+        print("CUDA is not available. Using CPU.")
+        USE_GPU = False
+except:
+    print("CUDA initialization failed. Using CPU.")
+    USE_GPU = False
+
+class BlockMapLocalization:
+    def __init__(self, block_map_size=100.0):
+        # Parameters
+        self.block_map_size = block_map_size  # Block map size S
+        self.bms = {}  # Block maps dictionary
+        self.bm_count = 0  # Block maps count C
+        self.centroids = []  # Centroids of block maps
+        self.current_bm = None  # Temporary storage for block map
+        self.base_trans = None  # Base translation
+        self.kdtree = None  # KD-Tree for centroids
+
+        # Sliding window parameters
+        self.Na = 20  # Maximum keyframes in single BM case
+        self.Nr = 5   # Reserved keyframes when switching BMs
+
+        # Current active BM
+        self.active_bm_id = None
+
+        # Pose tracking state variables
+        self.current_pose = None  # Current estimated pose
+        self.prev_pose = None     # Previous estimated pose
+
+        # Factor graph variables (simplified representation)
+        self.sliding_window = []  # List of poses in sliding window
+
+    def transform_points(self, points, transform):
+        """Apply transformation to points"""
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.transform(transform)
+        return np.asarray(pcd.points)
+
+    def build_kdtree(self):
+        """Build KD-Tree using centroids of block maps."""
+        if len(self.centroids) > 0:
+            self.kdtree = o3d.geometry.KDTreeFlann()
+            centroid_pcd = o3d.geometry.PointCloud()
+            centroid_pcd.points = o3d.utility.Vector3dVector(np.array(self.centroids))
+            self.kdtree.set_geometry(centroid_pcd)
+
+    def generate_block_maps(self, lidar_scans, poses, T_L_off=np.eye(4)):
+        """
+        Implementation of Algorithm 1: Block Maps (BMs) Generation Method
+
+        Args:
+            lidar_scans: List of LiDAR scans
+            poses: List of corresponding poses (T_Woff_off,m)
+            T_L_off: Extrinsic parameters (transformation from LiDAR to robot frame)
+        """
+        print("Generating block maps...")
+        start_time = time.time()
+
+        # Reset block maps
+        self.bms = {}
+        self.bm_count = 0
+        self.centroids = []
+        self.current_bm = None
+        self.base_trans = None
+
+        for i, (scan, pose) in enumerate(zip(lidar_scans, poses)):
+            # Find the closest pose to the pointcloud timestamp
+            # (We directly use the provided pose)
+            T_Woff_off = pose
+
+            # Transform LiDAR points via off_pi = (T_L_off)^(-1) * L_pi
+            off_points = self.transform_points(scan, np.linalg.inv(T_L_off))
+
+            # Get translation part of T_Woff_off
+            t_Woff_off = T_Woff_off[:3, 3]
+
+            # If it is the first pointcloud
+            if i == 0:
+                # Record the translation part of the corresponding pose
+                self.base_trans = t_Woff_off
+                # Create a new block map for temporary storage
+                self.current_bm = []
+
+            # Check Euclidean distance between base_trans and current translation
+            if np.linalg.norm(self.base_trans - t_Woff_off) <= self.block_map_size:
+                # Transform points to world frame and add to current block map
+                transformed_points = self.transform_points(off_points, T_Woff_off)
+                self.current_bm.append(transformed_points)
+            else:
+                # Update base translation
+                self.base_trans = t_Woff_off
+
+                # Process the current block map
+                self._process_current_block_map()
+
+                # Start a new block map
+                self.current_bm = []
+                transformed_points = self.transform_points(off_points, T_Woff_off)
+                self.current_bm.append(transformed_points)
+
+            # Print progress
+            if (i+1) % 10 == 0:
+                print(f"Processed {i+1}/{len(lidar_scans)} scans")
+
+        # Process the last block map if not empty
+        if self.current_bm:
+            self._process_current_block_map()
+
+        end_time = time.time()
+        print(f"Generated {self.bm_count} block maps in {end_time - start_time:.2f} seconds")
+        return self.bms
+
+    def save_block_maps(self, output_dir):
+        """Save block maps to disk"""
+        os.makedirs(output_dir, exist_ok=True)
+
+        for i, points in self.bms.items():
+            # Create point cloud
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points)
+
+            # Save to file
+            output_file = os.path.join(output_dir, f"block_map_{i:03d}.pcd")
+            o3d.io.write_point_cloud(output_file, pcd)
+            print(f"Saved block map {i} to {output_file}")
+
+        # Save centroids
+        centroid_file = os.path.join(output_dir, "centroids.txt")
+        with open(centroid_file, "w") as f:
+            for i, centroid in enumerate(self.centroids):
+                f.write(f"{i},{centroid[0]},{centroid[1]},{centroid[2]}\n")
+
+        print(f"Saved {self.bm_count} block maps to {output_dir}")
+
+    def _process_current_block_map(self):
+        """Helper method to process the current block map"""
+        if not self.current_bm:
+            return
+
+        # Combine all point clouds in the current block map
+        combined_points = np.vstack(self.current_bm)
+
+        # If this is the first or second block map
+        if self.bm_count <= 1:
+            # Store the block map
+            self.bms[self.bm_count] = combined_points
+
+            # Compute centroid
+            centroid = np.mean(combined_points, axis=0)
+            self.centroids.append(centroid)
+
+            # Build KD-Tree
+            self.build_kdtree()
+
+            # Increment block map count
+            self.bm_count += 1
+        else:
+            # Compute centroid of the current block map
+            centroid = np.mean(combined_points, axis=0)
+
+            # Find its nearest neighbor in KD-Tree
+            _, idx, dist = self.kdtree.search_knn_vector_3d(centroid, 1)
+
+            # Check distance conditions
+            if dist[0] >= 0.5 * self.block_map_size:
+                # Store as a new block map
+                self.bms[self.bm_count] = combined_points
+                self.centroids.append(centroid)
+                self.build_kdtree()
+                self.bm_count += 1
+            elif 0.1 * self.block_map_size < dist[0] < 0.5 * self.block_map_size:
+                # Merge with existing block map
+                nearest_idx = idx[0]
+                self.bms[nearest_idx] = np.vstack([self.bms[nearest_idx], combined_points])
+
+                # Update centroid
+                self.centroids[nearest_idx] = np.mean(self.bms[nearest_idx], axis=0)
+
+                # Rebuild KD-Tree
+                self.build_kdtree()
+
+    def load_block_maps(self, block_map_dir):
+        """
+        Load pre-existing block map files from a directory
+
+        Args:
+            block_map_dir: Directory containing block map files
+        """
+        print(f"Loading block maps from {block_map_dir}...")
+
+        # Find block map files
+        bm_files = sorted(glob.glob(os.path.join(block_map_dir, "*.pcd")))
+
+        if len(bm_files) == 0:
+            print("No block map files found.")
+            return False
+
+        # Reset block maps
+        self.bms = {}
+        self.bm_count = 0
+        self.centroids = []
+
+        # Load each block map
+        for i, bm_file in enumerate(bm_files):
+            print(f"Loading Block Map {i} from {os.path.basename(bm_file)}")
+
+            # Load point cloud
+            pcd = o3d.io.read_point_cloud(bm_file)
+            points = np.asarray(pcd.points)
+
+            if len(points) > 0:
+                # Store block map
+                self.bms[i] = points
+
+                # Compute centroid
+                centroid = np.mean(points, axis=0)
+                self.centroids.append(centroid)
+
+                # Increment count
+                self.bm_count += 1
+
+                print(f"  Loaded Block Map with {len(points)} points")
+                print(f"  Centroid: {centroid}")
+
+        # Try to load centroids
+        centroid_file = os.path.join(block_map_dir, "centroids.txt")
+        if os.path.exists(centroid_file):
+            self.centroids = []
+            with open(centroid_file, "r") as f:
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) >= 4:
+                        try:
+                            idx = int(parts[0])
+                            x = float(parts[1])
+                            y = float(parts[2])
+                            z = float(parts[3])
+                            self.centroids.append(np.array([x, y, z]))
+                        except:
+                            pass
+            print(f"Loaded {len(self.centroids)} centroids from file")
+
+        # Build KD-Tree
+        self.build_kdtree()
+
+        print(f"Successfully loaded {self.bm_count} block maps")
+        return True
+
+    def initialize_pose(self, lidar_scan, initial_pose_guess=None, resolutions=3):
+        """
+        Implementation of Branch-and-Bound Search (BBS) for pose initialization
+
+        Args:
+            lidar_scan: Current LiDAR scan
+            initial_pose_guess: Initial pose guess (optional)
+            resolutions: Number of resolution levels for map pyramid
+
+        Returns:
+            Estimated initial pose
+        """
+        print("Initializing pose...")
+        start_time = time.time()
+
+        # If no initial guess, use a default pose at the origin
+        if initial_pose_guess is None:
+            initial_pose_guess = np.eye(4)
+
+        # If no active block map, find the nearest one based on the initial guess
+        if self.active_bm_id is None:
+            self._select_active_block_map(initial_pose_guess[:3, 3])
+
+        # Get the active block map
+        if self.active_bm_id not in self.bms:
+            print(f"Error: Block map {self.active_bm_id} not found")
+            return initial_pose_guess
+
+        active_map = self.bms[self.active_bm_id]
+
+        # Create a map pyramid with different resolutions
+        map_pyramid = self._create_map_pyramid(active_map, resolutions)
+
+        # Define search parameters
+        search_range = {
+            'x': 40.0,  # meters
+            'y': 40.0,  # meters
+            'theta': np.pi/2  # radians
+        }
+
+        # Define step sizes for each resolution level
+        linear_step = [4.0, 2.0, 1.0]  # meters
+        angular_step = [np.pi/18, np.pi/36, np.pi/72]  # radians
+
+        # BBS search
+        current_pose = initial_pose_guess
+
+        for level in range(resolutions):
+            print(f"Searching at resolution level {level}")
+
+            current_map = map_pyramid[level]
+            r = linear_step[level]
+            delta_theta = angular_step[level]
+
+            # Define search window with adaptive sizing for faster GPU computation
+            step_factor = 3 if level == 0 else 2  # Larger steps for coarse levels
+            wx = max(1, int(search_range['x'] / (r * step_factor)))
+            wy = max(1, int(search_range['y'] / (r * step_factor)))
+            wtheta = max(1, int(search_range['theta'] / (delta_theta * step_factor)))
+
+            # Create search ranges (fewer points for faster search)
+            x_range = np.linspace(-search_range['x'], search_range['x'], 2*wx+1)
+            y_range = np.linspace(-search_range['y'], search_range['y'], 2*wy+1)
+            theta_range = np.linspace(-search_range['theta'], search_range['theta'], 2*wtheta+1)
+
+            best_score = float('inf')
+            best_pose = current_pose.copy()
+
+            # For the first level, do a coarse grid search
+            if level == 0:
+                # Pre-compute map KD-tree for faster matching
+                map_tree = o3d.geometry.KDTreeFlann()
+                map_pcd = o3d.geometry.PointCloud()
+                map_pcd.points = o3d.utility.Vector3dVector(current_map)
+                map_tree.set_geometry(map_pcd)
+
+                # Downsample scan for faster search
+                scan_pcd = o3d.geometry.PointCloud()
+                scan_pcd.points = o3d.utility.Vector3dVector(lidar_scan)
+                scan_down = scan_pcd.voxel_down_sample(voxel_size=0.5)
+                scan_points = np.asarray(scan_down.points)
+
+                # Grid search
+                grid_points = 0
+                for dx in x_range[::3]:  # Skip points for speed
+                    for dy in y_range[::3]:
+                        for dtheta in theta_range[::3]:
+                            # Create test pose
+                            test_pose = current_pose.copy()
+                            test_pose[0, 3] += dx
+                            test_pose[1, 3] += dy
+
+                            # Apply rotation
+                            rot = Rotation.from_euler('z', dtheta).as_matrix()
+                            test_pose[:3, :3] = rot @ test_pose[:3, :3]
+
+                            # Quick approximate evaluation
+                            score = self._fast_evaluate_pose(scan_points, test_pose, map_tree)
+                            grid_points += 1
+
+                            if score < best_score:
+                                best_score = score
+                                best_pose = test_pose.copy()
+
+                print(f"  Evaluated {grid_points} grid points")
+            else:
+                # Refine around the best pose from previous level
+                # Use faster ICP for refinement
+                source_pcd = o3d.geometry.PointCloud()
+                source_pcd.points = o3d.utility.Vector3dVector(lidar_scan)
+
+                target_pcd = o3d.geometry.PointCloud()
+                target_pcd.points = o3d.utility.Vector3dVector(current_map)
+
+                # Downsample for faster ICP
+                voxel_size = 0.5 if level == 1 else 0.2
+                source_down = source_pcd.voxel_down_sample(voxel_size)
+                target_down = target_pcd.voxel_down_sample(voxel_size)
+
+                # Set up ICP
+                icp_result = o3d.pipelines.registration.registration_icp(
+                    source_down, target_down,
+                    max_correspondence_distance=1.0,
+                    init=best_pose,
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                    criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20)
+                )
+
+                best_pose = icp_result.transformation
+                best_score = icp_result.fitness
+
+            # Update current pose for next resolution level
+            current_pose = best_pose.copy()
+            search_range = {k: v/2 for k, v in search_range.items()}
+
+        end_time = time.time()
+        print(f"Pose initialization complete in {end_time - start_time:.2f} seconds. Score: {best_score}")
+        self.current_pose = current_pose
+        return current_pose
+
+    def _fast_evaluate_pose(self, scan, pose, map_tree, sample_size=50):
+        """Fast approximate evaluation of pose"""
+        # Transform scan to world frame
+        transformed_scan = self.transform_points(scan, pose)
+
+        # For performance, sample points
+        indices = np.random.choice(len(transformed_scan), min(sample_size, len(transformed_scan)), replace=False)
+        sampled_points = transformed_scan[indices]
+
+        # Calculate point-to-point distances
+        total_dist = 0
+        for point in sampled_points:
+            _, _, dist = map_tree.search_knn_vector_3d(point, 1)
+            total_dist += dist[0]
+
+        # Return average distance as score (lower is better)
+        return total_dist / len(sampled_points)
+
+    def _select_active_block_map(self, position):
+        """Select the nearest block map as active"""
+        if not self.centroids:
+            print("No block maps available")
+            return
+
+        # Find the nearest block map
+        _, idx, _ = self.kdtree.search_knn_vector_3d(position, 1)
+        self.active_bm_id = idx[0]
+        print(f"Selected block map {self.active_bm_id} as active")
+
+    def _create_map_pyramid(self, points, levels):
+        """Create a map pyramid with different resolutions"""
+        pyramid = [points]  # Level 0: original resolution
+
+        # Create downsampled versions
+        for i in range(1, levels):
+            # Downsample using voxel grid
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(pyramid[i-1])
+
+            voxel_size = 0.2 * (2**i)  # Increase voxel size at each level
+            downsampled_pcd = pcd.voxel_down_sample(voxel_size)
+
+            pyramid.append(np.asarray(downsampled_pcd.points))
+
+        return pyramid
+
+    def track_pose(self, lidar_scan, imu_data=None):
+        """
+        Implementation of pose tracking using factor graph optimization with dynamic sliding window
+
+        Args:
+            lidar_scan: Current LiDAR scan
+            imu_data: IMU measurements (optional)
+
+        Returns:
+            Updated pose
+        """
+        if self.current_pose is None:
+            print("Error: Need to initialize pose first")
+            return None
+
+        # Check if we need to switch block maps
+        self._check_and_switch_block_maps()
+
+        # Get the active block map
+        if self.active_bm_id not in self.bms:
+            print(f"Error: Block map {self.active_bm_id} not found")
+            return self.current_pose
+
+        active_map = self.bms[self.active_bm_id]
+
+        # Motion prediction (using previous poses)
+        if self.prev_pose is not None:
+            pred_pose = self._predict_motion(self.current_pose, self.prev_pose)
+        else:
+            pred_pose = self.current_pose.copy()
+
+        # NDT scan-to-map matching for initial alignment
+        aligned_pose = self._ndt_matching(lidar_scan, pred_pose, active_map)
+
+        # Add factors to the graph
+        self._add_factors(aligned_pose, lidar_scan, imu_data)
+
+        # Optimize the factor graph using sliding window
+        optimized_pose = self._optimize_sliding_window()
+
+        # Update state
+        self.prev_pose = self.current_pose.copy()
+        self.current_pose = optimized_pose.copy()
+
+        return optimized_pose
+
+    def _check_and_switch_block_maps(self):
+        """Check if we need to switch to a different block map"""
+        if self.current_pose is None:
+            return
+
+        # Check distance to current block map centroid
+        if self.active_bm_id is not None:
+            current_position = self.current_pose[:3, 3]
+            active_centroid = self.centroids[self.active_bm_id]
+
+            dist_to_centroid = np.linalg.norm(current_position - active_centroid)
+
+            # If we're too far from the current block map, switch to a closer one
+            if dist_to_centroid > 0.7 * self.block_map_size:
+                print(f"Switching block maps (distance to centroid: {dist_to_centroid:.2f})")
+                self._select_active_block_map(current_position)
+
+                # When switching maps, adjust the sliding window
+                self._adjust_sliding_window_for_map_switch()
+
+    def _predict_motion(self, current_pose, prev_pose):
+        """Predict the next pose based on constant velocity model"""
+        # Simple motion prediction using the last two poses
+        motion = np.linalg.inv(prev_pose) @ current_pose
+        predicted_pose = current_pose @ motion
+        return predicted_pose
+
+    def _ndt_matching(self, scan, initial_pose, map_points):
+        """
+        Normal Distribution Transform matching for scan-to-map alignment
+        Using faster ICP for Colab environment
+        """
+        # Create point clouds
+        source_pcd = o3d.geometry.PointCloud()
+        source_pcd.points = o3d.utility.Vector3dVector(scan)
+
+        target_pcd = o3d.geometry.PointCloud()
+        target_pcd.points = o3d.utility.Vector3dVector(map_points)
+
+        # Downsample for performance
+        voxel_size = 0.5
+        source_down = source_pcd.voxel_down_sample(voxel_size)
+        target_down = target_pcd.voxel_down_sample(voxel_size)
+
+        # Set up ICP parameters
+        result = o3d.pipelines.registration.registration_icp(
+            source_down, target_down,
+            max_correspondence_distance=1.0,
+            init=initial_pose,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=15)
+        )
+
+        return result.transformation
+
+    def _add_factors(self, pose, scan, imu_data):
+        """Add new factors to the factor graph"""
+        # In a real implementation, this would add proper factor graph nodes
+        # Here we just store poses and observations in the sliding window
+        self.sliding_window.append({
+            'pose': pose,
+            'scan': scan,
+            'imu': imu_data
+        })
+
+        # Manage sliding window size
+        if self.active_bm_id is not None:
+            # In single BM case, keep maximum Na keyframes
+            if len(self.sliding_window) > self.Na:
+                # Marginalize oldest keyframe
+                self.sliding_window.pop(0)
+
+    def _adjust_sliding_window_for_map_switch(self):
+        """Adjust sliding window when switching block maps"""
+        # Keep only Nr keyframes when switching maps
+        if len(self.sliding_window) > self.Nr:
+            # Keep only the most recent Nr keyframes
+            self.sliding_window = self.sliding_window[-self.Nr:]
+
+    def _optimize_sliding_window(self):
+        """
+        Optimize the factor graph to get refined poses
+        This is a simplified implementation (Equations 11-13 in the paper)
+        """
+        # In a real implementation, this would solve the factor graph
+        # For simplicity, we'll just return the most recent pose
+        if not self.sliding_window:
+            return self.current_pose
+
+        return self.sliding_window[-1]['pose']
+
+    def visualize_block_maps(self, show_individually=False, delay=1, enhanced_colors=True):
+        """Visualize the generated block maps using matplotlib"""
+        if not self.bms:
+            print("No block maps to visualize")
+            return
+
+        # Show 3D visualization with enhanced colors
+        if enhanced_colors:
+            # Create a combined point cloud for better visualization
+            combined_pcd = o3d.geometry.PointCloud()
+            combined_points = []
+            combined_colors = []
+
+            # Add points from each block map with vibrant colors
+            color_palette = [
+                [1.0, 0.0, 0.0],  # Red
+                [0.0, 1.0, 0.0],  # Green
+                [0.5, 0.0, 1.0],  # Purple
+                [1.0, 0.5, 0.0],  # Orange
+                [0.0, 0.5, 1.0],  # Azure
+                [1.0, 0.0, 0.5],  # Pink
+                [0.5, 1.0, 0.0],  # Lime
+                [0.0, 1.0, 0.5],  # Teal
+                [0.5, 0.5, 1.0],  # Light purple
+                [1.0, 1.0, 0.0],  # Yellow
+            ]
+
+            for i, bm_points in self.bms.items():
+                # Limit points for better performance
+                max_points = min(100000, len(bm_points))
+                if len(bm_points) > max_points:
+                    indices = np.random.choice(len(bm_points), max_points, replace=False)
+                    points = bm_points[indices]
+                else:
+                    points = bm_points
+
+                # Color based on height (z-coordinate) within each block map
+                color_idx = i % len(color_palette)
+                base_color = np.array(color_palette[color_idx])
+
+                # Get z-range for each block map
+                z_min, z_max = np.min(points[:, 2]), np.max(points[:, 2])
+                z_range = max(0.1, z_max - z_min)  # Avoid division by zero
+
+                # Create height-based colors
+                colors = np.zeros((len(points), 3))
+                for j in range(len(points)):
+                    # Normalize z height
+                    z_norm = (points[j, 2] - z_min) / z_range
+                    # Mix with base color and add some variation
+                    colors[j] = base_color * (0.5 + 0.5 * z_norm)
+
+                combined_points.append(points)
+                combined_colors.append(colors)
+
+            # Combine all points and colors
+            if combined_points:
+                all_points = np.vstack(combined_points)
+                all_colors = np.vstack(combined_colors)
+
+                # Create colored point cloud
+                combined_pcd.points = o3d.utility.Vector3dVector(all_points)
+                combined_pcd.colors = o3d.utility.Vector3dVector(all_colors)
+
+                # Export the colored point cloud as an image
+                vis = o3d.visualization.Visualizer()
+
+                try:
+                    vis.create_window(visible=False)
+                    vis.add_geometry(combined_pcd)
+
+                    # Set rendering options for better visualization
+                    render_option = vis.get_render_option()
+                    render_option.background_color = np.array([0, 0, 0])  # Black background
+                    render_option.point_size = 1.0
+
+                    # Set a good viewpoint
+                    view_control = vis.get_view_control()
+                    view_control.set_zoom(0.6)
+                    view_control.set_front([0, 0, -1])  # Look from top
+                    view_control.set_lookat([0, 0, 0])
+                    view_control.set_up([0, -1, 0])
+
+                    # Capture the image
+                    vis.poll_events()
+                    vis.update_renderer()
+                    image = vis.capture_screen_float_buffer()
+
+                    # Convert image to numpy array and display
+                    image_np = np.asarray(image)
+                    plt.figure(figsize=(12, 10))
+                    plt.imshow(image_np)
+                    plt.axis('off')
+                    plt.title('Block Maps - 3D Visualization')
+                    plt.tight_layout()
+                    plt.show()
+
+                finally:
+                    vis.destroy_window()
+
+                print(f"Visualized {self.bm_count} block maps with enhanced colors")
+
+        # Create top-down view of all block maps together
+        plt.figure(figsize=(12, 10))
+
+        # Plot each block map with a different color
+        for i, bm_points in self.bms.items():
+            # Downsample for visualization
+            max_points = min(3000, len(bm_points))
+            indices = np.random.choice(len(bm_points), max_points, replace=False)
+            sampled_points = bm_points[indices]
+
+            # Generate a unique color
+            color = np.random.random(3)
+
+            plt.scatter(
+                sampled_points[:, 0],
+                sampled_points[:, 1],
+                c=[color],
+                s=1,
+                label=f'BM {i}'
+            )
+
+        # Add centroids
+        centroid_array = np.array(self.centroids)
+        plt.scatter(
+            centroid_array[:, 0],
+            centroid_array[:, 1],
+            c='red',
+            s=50,
+            marker='x'
+        )
+
+        # For each centroid, add a text label
+        for i, centroid in enumerate(self.centroids):
+            plt.text(centroid[0], centroid[1], f"BM {i}", fontsize=9)
+
+        plt.xlabel('X (m)')
+        plt.ylabel('Y (m)')
+        plt.title('All Block Maps (Top View)')
+        plt.grid(True)
+        plt.axis('equal')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    def visualize_localization(self, trajectory=None):
+        """Visualize the localization result with trajectory using matplotlib"""
+        if not self.bms or self.active_bm_id is None:
+            print("No block maps or active block map")
+            return
+
+        # Get active block map
+        active_map = self.bms[self.active_bm_id]
+
+        plt.figure(figsize=(12, 10))
+
+        # Downsample map for visualization
+        max_points = min(5000, len(active_map))
+        indices = np.random.choice(len(active_map), max_points, replace=False)
+        sampled_points = active_map[indices]
+
+        # Plot active block map
+        plt.scatter(
+            sampled_points[:, 0],
+            sampled_points[:, 1],
+            c='lightgray',
+            s=1,
+            label=f'Block Map {self.active_bm_id}'
+        )
+
+        # Plot current pose
+        if self.current_pose is not None:
+            position = self.current_pose[:3, 3]
+            plt.scatter(position[0], position[1], c='g', s=100, marker='o', label='Current Pose')
+
+            # Add orientation arrow
+            heading = np.arctan2(self.current_pose[1, 0], self.current_pose[0, 0])
+            arrow_length = 20
+            dx = arrow_length * np.cos(heading)
+            dy = arrow_length * np.sin(heading)
+            plt.arrow(position[0], position[1], dx, dy, head_width=5, head_length=10, fc='g', ec='g')
+
+        # Plot trajectory if provided
+        if trajectory is not None and len(trajectory) > 0:
+            trajectory = np.array(trajectory)
+            plt.plot(trajectory[:, 0], trajectory[:, 1], 'r-', linewidth=2, label='Trajectory')
+
+            # Mark start and end points
+            plt.scatter(trajectory[0, 0], trajectory[0, 1], c='b', s=100, marker='^', label='Start')
+            plt.scatter(trajectory[-1, 0], trajectory[-1, 1], c='r', s=100, marker='*', label='End')
+
+        plt.xlabel('X (m)')
+        plt.ylabel('Y (m)')
+        plt.title('Localization Result')
+        plt.grid(True)
+        plt.axis('equal')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+
+def process_pcd_directory(directory, block_map_size=50.0, max_files=40, visualize_raw=True):
+    """
+    Process PCD files from a directory
+
+    Args:
+        directory: Directory containing PCD files
+        block_map_size: Size of block maps in meters
+        max_files: Maximum number of PCD files to process
+        visualize_raw: Whether to visualize raw point clouds
+    """
+    # Find all PCD files
+    pcd_files = sorted(glob.glob(os.path.join(directory, "*.pcd")))
+    pcd_files = [f for f in pcd_files if 'CentroidCloud' not in f and 'GlobalMap' not in f and 'BM' not in f]
+
+    if len(pcd_files) == 0:
+        print("No PCD files found.")
+        return
+
+    # Limit files
+    if len(pcd_files) > max_files:
+        pcd_files = pcd_files[:max_files]
+
+    print(f"Processing {len(pcd_files)} PCD files")
+
+    # Visualize a raw point cloud with enhanced colors if requested
+    if visualize_raw and len(pcd_files) > 0:
+        print("Visualizing a sample raw point cloud with enhanced colors...")
+        sample_pcd = o3d.io.read_point_cloud(pcd_files[0])
+        points = np.asarray(sample_pcd.points)
+
+        # Create colored point cloud
+        colored_pcd = o3d.geometry.PointCloud()
+        colored_pcd.points = o3d.utility.Vector3dVector(points)
+
+        # Color based on distance from sensor origin (assuming origin is at [0,0,0])
+        colors = np.zeros((len(points), 3))
+        distances = np.linalg.norm(points, axis=1)
+        dist_min, dist_max = np.min(distances), np.max(distances)
+        dist_range = dist_max - dist_min
+
+        # Create a colormap
+        for i in range(len(points)):
+            norm_dist = (distances[i] - dist_min) / dist_range
+
+            # Red to purple color scheme
+            if norm_dist < 0.25:
+                # Red to orange
+                r = 1.0
+                g = norm_dist * 4 * 0.5
+                b = 0.0
+            elif norm_dist < 0.5:
+                # Orange to green
+                r = 1.0 - (norm_dist - 0.25) * 4
+                g = 0.5 + (norm_dist - 0.25) * 2
+                b = 0.0
+            elif norm_dist < 0.75:
+                # Green to blue
+                r = 0.0
+                g = 1.0 - (norm_dist - 0.5) * 4
+                b = (norm_dist - 0.5) * 4
+            else:
+                # Blue to purple
+                r = (norm_dist - 0.75) * 4
+                g = 0.0
+                b = 1.0
+
+            colors[i] = [r, g, b]
+
+        colored_pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        # Visualize
+        vis = o3d.visualization.Visualizer()
+        try:
+            vis.create_window(visible=False)
+            vis.add_geometry(colored_pcd)
+
+            # Set rendering options
+            render_option = vis.get_render_option()
+            render_option.background_color = np.array([0, 0, 0])  # Black background
+            render_option.point_size = 1.5
+
+            # Set a good viewpoint
+            view_control = vis.get_view_control()
+            view_control.set_zoom(0.8)
+
+            # Capture image
+            vis.poll_events()
+            vis.update_renderer()
+            image = vis.capture_screen_float_buffer()
+
+            # Display image
+            plt.figure(figsize=(12, 10))
+            plt.imshow(np.asarray(image))
+            plt.axis('off')
+            plt.title('Raw Point Cloud Visualization')
+            plt.tight_layout()
+            plt.show()
+
+        finally:
+            vis.destroy_window()
+
+    # Load LiDAR scans
+    lidar_scans = []
+    for i, pcd_file in enumerate(pcd_files):
+        print(f"Loading scan {i+1}/{len(pcd_files)}: {os.path.basename(pcd_file)}")
+        pcd = o3d.io.read_point_cloud(pcd_file)
+
+        # Downsample for performance
+        pcd_down = pcd.voxel_down_sample(voxel_size=0.2)
+        points = np.asarray(pcd_down.points)
+
+        if len(points) > 0:
+            lidar_scans.append(points)
+
+    print(f"Loaded {len(lidar_scans)} LiDAR scans")
+
+    # Create synthetic poses along a realistic trajectory
+    # This is needed because we don't have ground truth poses
+    poses = []
+    trajectory = []
+
+    # Create a simple trajectory with some realistic movement patterns
+    # Starting at the origin
+    x, y, z = 0, 0, 0
+    heading = 0  # Initial heading (radians)
+
+    for i in range(len(lidar_scans)):
+        # Add some realistic motion
+        if i > 0:
+            # Simulate a bit of turning
+            heading += np.random.normal(0, 0.05)  # Small random heading changes
+
+            # Move forward with some random sideways motion
+            forward_dist = 2.0  # Average forward movement (meters)
+            sideways_dist = np.random.normal(0, 0.2)  # Small sideways drift
+
+            dx = forward_dist * np.cos(heading) - sideways_dist * np.sin(heading)
+            dy = forward_dist * np.sin(heading) + sideways_dist * np.cos(heading)
+
+            x += dx
+            y += dy
+
+        # Create pose
+        pose = np.eye(4)
+        pose[:3, 3] = [x, y, z]
+
+        # Set orientation based on heading
+        rot = Rotation.from_euler('z', heading).as_matrix()
+        pose[:3, :3] = rot
+
+        poses.append(pose)
+        trajectory.append([x, y, z])
+
+    # Plot the synthetic trajectory
+    plt.figure(figsize=(10, 8))
+    traj = np.array(trajectory)
+    plt.plot(traj[:, 0], traj[:, 1], 'b-')
+    plt.scatter(traj[0, 0], traj[0, 1], c='g', s=100, marker='^', label='Start')
+    plt.scatter(traj[-1, 0], traj[-1, 1], c='r', s=100, marker='*', label='End')
+
+    plt.title('Synthetic Trajectory for Block Map Generation')
+    plt.xlabel('X (m)')
+    plt.ylabel('Y (m)')
+    plt.axis('equal')
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+
+    # Create the localization system
+    localizer = BlockMapLocalization(block_map_size=block_map_size)
+
+    # Generate block maps
+    block_maps = localizer.generate_block_maps(lidar_scans, poses)
+
+    # Save block maps if needed
+    block_map_dir = os.path.join(directory, 'block_maps')
+    localizer.save_block_maps(block_map_dir)
+
+    # Visualize block maps
+    localizer.visualize_block_maps()
+
+    # Simulate localization
+    if len(lidar_scans) > 1:
+        estimated_trajectory = []
+
+        # Initialize pose
+        initial_pose = poses[0]
+        localizer.initialize_pose(lidar_scans[0], initial_pose)
+        estimated_trajectory.append(initial_pose[:3, 3])
+
+        # Track pose for frames
+        tracking_frames = min(len(lidar_scans)-1, 20)
+        start_time = time.time()
+
+        for i in range(1, tracking_frames):
+            print(f"Tracking frame {i}/{tracking_frames}")
+
+            # Track pose
+            estimated_pose = localizer.track_pose(lidar_scans[i])
+
+            if estimated_pose is not None:
+                estimated_trajectory.append(estimated_pose[:3, 3])
+
+        end_time = time.time()
+        avg_time = (end_time - start_time) / tracking_frames
+        print(f"Tracking complete: average time per frame: {avg_time:.4f} seconds")
+
+        # Visualize localization results
+        localizer.visualize_localization(np.array(estimated_trajectory))
+
+        # Plot trajectory comparison
+        plt.figure(figsize=(10, 8))
+
+        # Ground truth trajectory (synthetic)
+        ground_truth = np.array(trajectory[:tracking_frames+1])
+        plt.plot(ground_truth[:, 0], ground_truth[:, 1], 'b-', label='Synthetic Ground Truth')
+
+        # Estimated trajectory
+        estimated_trajectory = np.array(estimated_trajectory)
+        plt.plot(estimated_trajectory[:, 0], estimated_trajectory[:, 1], 'r--', label='Estimated')
+
+        plt.axis('equal')
+        plt.grid(True)
+        plt.legend()
+        plt.title('Trajectory Comparison')
+        plt.xlabel('X (m)')
+        plt.ylabel('Y (m)')
+        plt.show()
+
+# Additional functions for enhanced visualization
+def visualize_colored_point_cloud(pcd_file):
+    """
+    Create a high-quality colored visualization of a point cloud file
+
+    Args:
+        pcd_file: Path to PCD file
+    """
+    print(f"Generating enhanced visualization for {os.path.basename(pcd_file)}...")
+
+    # Load point cloud
+    pcd = o3d.io.read_point_cloud(pcd_file)
+    points = np.asarray(pcd.points)
+
+    if len(points) == 0:
+        print("Point cloud is empty")
+        return
+
+    # Create a rich color mapping based on spatial features
+    colors = np.zeros((len(points), 3))
+
+    # Get coordinate ranges
+    x_min, x_max = np.min(points[:, 0]), np.max(points[:, 0])
+    y_min, y_max = np.min(points[:, 1]), np.max(points[:, 1])
+    z_min, z_max = np.min(points[:, 2]), np.max(points[:, 2])
+
+    # Normalize coordinates
+    x_norm = (points[:, 0] - x_min) / (x_max - x_min) if x_max > x_min else np.zeros(len(points))
+    y_norm = (points[:, 1] - y_min) / (y_max - y_min) if y_max > y_min else np.zeros(len(points))
+    z_norm = (points[:, 2] - z_min) / (z_max - z_min) if z_max > z_min else np.zeros(len(points))
+
+    # Distance from center (normalized)
+    center_x, center_y = (x_max + x_min) / 2, (y_max + y_min) / 2
+    distances = np.sqrt((points[:, 0] - center_x)**2 + (points[:, 1] - center_y)**2)
+    dist_min, dist_max = np.min(distances), np.max(distances)
+    dist_norm = (distances - dist_min) / (dist_max - dist_min) if dist_max > dist_min else np.zeros(len(points))
+
+    # Create rich color mapping based on these features
+    for i in range(len(points)):
+        # Create color mixing based on position and distance
+        # Red channel influenced by X position and distance
+        r = 0.7 * x_norm[i] + 0.3 * (1-dist_norm[i])
+
+        # Green channel influenced by Y position
+        g = 0.8 * y_norm[i] + 0.2 * dist_norm[i]
+
+        # Blue channel influenced by Z position
+        b = z_norm[i]
+
+        # Add some color variation to make it more vibrant
+        # Purple/magenta tones for higher points
+        if z_norm[i] > 0.7:
+            r = 0.7 * r + 0.3
+            b = 0.7 * b + 0.3
+
+        # Green tones for middle height points
+        elif 0.3 < z_norm[i] <= 0.7:
+            g = 0.7 * g + 0.3
+
+        # Red/orange tones for lower points
+        else:
+            r = 0.7 * r + 0.3
+            g = 0.4 * g
+
+        colors[i] = [r, g, b]
+
+    # Apply colors to point cloud
+    colored_pcd = o3d.geometry.PointCloud()
+    colored_pcd.points = o3d.utility.Vector3dVector(points)
+    colored_pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    # Visualize with high quality settings
+    vis = o3d.visualization.Visualizer()
+    try:
+        vis.create_window(visible=False)
+        vis.add_geometry(colored_pcd)
+
+        # Set rendering options for better visualization
+        render_option = vis.get_render_option()
+        render_option.background_color = np.array([0, 0, 0])  # Black background
+        render_option.point_size = 2.0
+
+        # Try different viewpoints and capture multiple images
+        views = [
+            {"front": [0.5, 0.5, -1], "lookat": [0, 0, 0], "up": [0, -1, 0], "zoom": 0.7, "name": "perspective"},
+            {"front": [0, 0, -1], "lookat": [0, 0, 0], "up": [0, -1, 0], "zoom": 0.6, "name": "top"},
+            {"front": [1, 0, 0], "lookat": [0, 0, 0], "up": [0, 0, 1], "zoom": 0.6, "name": "side"}
+        ]
+
+        for view in views:
+            # Set viewpoint
+            view_control = vis.get_view_control()
+            view_control.set_front(view["front"])
+            view_control.set_lookat(view["lookat"])
+            view_control.set_up(view["up"])
+            view_control.set_zoom(view["zoom"])
+
+            # Capture and display image
+            vis.poll_events()
+            vis.update_renderer()
+            image = vis.capture_screen_float_buffer()
+
+            plt.figure(figsize=(12, 10))
+            plt.imshow(np.asarray(image))
+            plt.axis('off')
+            plt.title(f'Enhanced Point Cloud - {view["name"]} view')
+            plt.tight_layout()
+            plt.show()
+
+    finally:
+        vis.destroy_window()
+
+# Usage example
+if __name__ == "__main__":
+    # Directory containing PCD files
+    pcd_directory = "/content/drive/MyDrive/20120115"
+
+    # Visualize a single point cloud with enhanced colors (similar to the image you showed)
+    pcd_files = sorted(glob.glob(os.path.join(pcd_directory, "*.pcd")))
+    if pcd_files:
+        # Choose a single file for high-quality visualization
+        visualize_colored_point_cloud(pcd_files[0])
+
+    # Process the PCD files with block map generation and localization
+    process_pcd_directory(
+        directory=pcd_directory,
+        block_map_size=50.0,  # Size of block maps in meters
+        max_files=40,         # Limit number of files for faster processing
+        visualize_raw=True    # Also visualize raw point cloud with colors
+    )
