@@ -1,0 +1,81 @@
+import open3d as o3d
+import numpy as np
+import glob
+import os
+import time
+
+# Find all PCD files in a directory
+def find_pcd_files(directory):
+    return sorted(glob.glob(os.path.join(directory, "*.pcd")))
+
+# Load point clouds and visualize them together
+def visualize_all_point_clouds(directory):
+    # Find PCD files
+    pcd_files = find_pcd_files(directory)
+    print(f"Found {len(pcd_files)} PCD files")
+
+    if len(pcd_files) == 0:
+        print("No PCD files found in the directory.")
+        return
+
+    # Part 1: Sequential visualization
+    print("PART 1: Sequential visualization of each point cloud")
+    vis = o3d.visualization.Visualizer()
+    vis.create_window("Sequential Point Cloud Viewer", width=800, height=600)
+
+    # Add coordinate frame for reference
+    coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+    vis.add_geometry(coordinate_frame)
+
+    # Loop through all point clouds
+    point_clouds = []
+    for i, pcd_file in enumerate(pcd_files):
+        # Load point cloud
+        print(f"Loading {i+1}/{len(pcd_files)}: {os.path.basename(pcd_file)}")
+        pcd = o3d.io.read_point_cloud(pcd_file)
+        point_clouds.append(pcd)
+
+        # Assign a unique color to this point cloud
+        color = np.array([np.random.random(), np.random.random(), np.random.random()])
+        pcd.paint_uniform_color(color)
+
+        # Clear previous cloud (except coordinate frame) and add new one
+        vis.clear_geometries()
+        vis.add_geometry(coordinate_frame)
+        vis.add_geometry(pcd)
+
+        # Update view
+        vis.update_geometry(pcd)
+        vis.poll_events()
+        vis.update_renderer()
+
+        # Wait for 2 seconds
+        time.sleep(2)
+
+    vis.destroy_window()
+
+    # Part 2: Combined visualization
+    print("\nPART 2: Combined visualization of all point clouds")
+    vis = o3d.visualization.Visualizer()
+    vis.create_window("Combined Point Cloud Viewer", width=1024, height=768)
+
+    # Add all point clouds with different colors
+    for i, pcd in enumerate(point_clouds):
+        # Use the color already assigned
+        vis.add_geometry(pcd)
+
+    # Add coordinate frame
+    vis.add_geometry(coordinate_frame)
+
+    # Set optimal camera viewpoint
+    vis.get_view_control().set_zoom(0.8)
+
+    print("Showing all point clouds together. Close the window when finished.")
+    vis.run()
+    vis.destroy_window()
+
+# Change this to your directory containing PCD files
+directory = "/path/to/your/pointcloud_folder"
+
+# Run the visualization
+visualize_all_point_clouds(directory)
